@@ -1,28 +1,54 @@
-# Code by Pablo Sauma-Chacon uNID 01471328
-
-import numpy as np
-import random
-import sys
-sys.path.append("../ML-Library/Preprocess")
-from CSVLoader import CSVLoader, remove_column, get_column, swap_columns
-from OneHotEncoding import OneHotEncoding
-from DiscretizeNumericalAtMedian import DiscretizeNumericalAtMedian
-from ReplaceMissingWithMajority import ReplaceMissingWithMajority
-from DiscretizeNumericalWithNormal import DiscretizeNumericalWithNormal
-sys.path.append("../ML-Library/DecisionTree")
-from ID3 import ID3
-sys.path.append("../ML-Library/EnsambleLearning")
-from Bagging import Bagging
-from AdaBoost import AdaBoost
-sys.path.append("../ML-Library/Postprocess")
-from Metrics import *
-
+# -*- coding: utf-8 -*-
+"""
+@author: Blopa
+"""
 try:
-    import matplotlib.pyplot as plt
-    plot = True
-except ImportError:
-    print("Missing matplotlib.pyplot")
-    plot = False
+    import json
+    SAVE = True
+except ModuleNotFoundError:
+    SAVE = False
+import numpy as np
+import pandas as pd
+import random
+import sklearn.ensemble
+import sklearn.linear_model
+import sklearn.metrics
+import sklearn.model_selection
+import sklearn.neighbors
+import sklearn.preprocessing
+import sklearn.svm
+import time
+import torch
+import torch.nn as nn
+import torch.optim as opt
+
+from NeuralNetwork import NeuralNetwork,NeuralNetworkTrainer
+
+RANDOMNESS_SEED = 21
+
+REPLACE_WITH_MAJORITY = True
+SCALE_VALUES = True
+REMOVE_SKEW = True
+
+TUNE_ALL = True
+
+TUNE_NN = False or TUNE_ALL
+TUNE_RF = False or TUNE_ALL
+TUNE_BAGGING = False or TUNE_ALL
+TUNE_SVM = False or TUNE_ALL
+TUNE_LINEARSGD = False or TUNE_ALL
+TUNE_KNEIGHBORS = False or TUNE_ALL
+
+def test_model_kfolds(X, y, k, measureF, Model, seed, **kwargs):
+    kf = sklearn.model_selection.KFold(n_splits=k, shuffle=True, random_state=seed)
+    measures = []
+    for i, (train_index, test_index) in enumerate(kf.split(X)):
+        model = Model(**kwargs)
+        model.fit(X[train_index], y[train_index])
+        pred = model.predict(X[test_index])
+        measure = measureF(y[test_index], pred)
+        measures.append(measure)
+    return sum(measures)/k
 
 def prediction_to_output(ids, pred, filename):
     with open(filename, 'w') as ofile:
@@ -30,188 +56,318 @@ def prediction_to_output(ids, pred, filename):
         for i,id in enumerate(ids):
             ofile.write(f'{id},{pred[i]}\n')
 
-class RandomBinaryPredictor:
-    def __init__(self, seed=None):
-        self.prng = random.Random()
-        self.prng.seed(seed)
-    
-    def predict(self, x):
-        return np.array([(self.prng.random()*2)-1 for i in range(x.shape[0])])
-
-def train_test_split(data, porcentage, seed):
-    prng = random.Random()
-    prng.seed(seed)
-    idx = set(i for i in range(len(data)))
-    train_idx = prng.sample(list(idx),k=int(len(data)*porcentage))
-    train = [data[i] for i in train_idx]
-    test_idx = idx - set(train_idx)
-    test = [data[i] for i in test_idx]
-    return train,test
-
 if __name__ == "__main__":
+    train = pd.read_csv('train_final.csv')
+    to_predict = pd.read_csv('test_final.csv')
+    ids = to_predict['ID']
     
-    data_description = {
-        'target': 'income>50K',
-        'columns': 'age,workclass,fnlwgt,education,education.num,marital.status,occupation,relationship,race,sex,capital.gain,capital.loss,hours.per.week,native.country,income>50K'.split(','),
-        'numerical': 'age,fnlwgt,education.num,capital.gain,capital.loss,hours.per.week'.split(','),
-        'categorical': 'workclass,education,marital.status,occupation,relationship,race,sex,native.country'.split(',')
-    }
-    test_description = {
-        'columns': 'ID,age,workclass,fnlwgt,education,education.num,marital.status,occupation,relationship,race,sex,capital.gain,capital.loss,hours.per.week,native.country'.split(','),
-        'numerical': 'age,fnlwgt,education.num,capital.gain,capital.loss,hours.per.week'.split(','),
-        'categorical': 'workclass,education,marital.status,occupation,relationship,race,sex,native.country'.split(',')
-    }
+    target = 'income>50K'
+    categorical = [col for col in train.columns if train.dtypes[col] == object]
+    preprocess_id = ''
     
-    odata = CSVLoader('train_final.csv', data_description, skip=1)
-    ocompetition = CSVLoader('test_final.csv', test_description, skip=1)
-    # Remove id column
-    ids = get_column(ocompetition, test_description, 'ID')
-    ocompetition,test_description = remove_column(ocompetition, test_description, 'ID')
-    
-    # First entry: random predictor
-    rbp = RandomBinaryPredictor()
-    # pred = rbp.predict(test)
-    # prediction_to_output(test, pred, 'random_commit.csv')
+    if REPLACE_WITH_MAJORITY:
+        preprocess_id += '_rwm'
+        missing = '?'
+        counts = {label: {col: {cat:0 for cat in train[col].unique() if cat!=missing} for col in categorical} for label in train[target].unique()}
+        for i,row in train.iterrows():
+            for col in categorical:
+                if row[col] != missing: counts[row[target]][col][row[col]] += 1
+        majority = {label: {col: max(zip( counts[label][col].values(), counts[label][col].keys() ))[1] for col in categorical} for label in train[target].unique()}    
+        for i,row in train.iterrows():
+            for col in categorical:
+                if row[col] == missing: train.at[i, col] = majority[row[target]][col]
 
-    preprocess=''
+    y_train = train[target]    
+    x_train = pd.get_dummies(train, columns=categorical).drop(columns=[target]).astype(np.int64)
     
-    # Replace Missing with Majority
-    replacer = ReplaceMissingWithMajority(odata, data_description, missing='?')
-    data = replacer(odata,labeled=True)
-    competition = replacer(ocompetition,labeled=False)
-    preprocess += '_RWM'
+    predict = pd.get_dummies(to_predict, columns=categorical).astype(np.int64)
+    predict = predict.drop(columns=list(set(predict.columns) - set(x_train.columns)))
     
-    # Discretize numeric values with categories based on normal distribution
-    discretizer = DiscretizeNumericalWithNormal(data, data_description)
-    data = discretizer(data, data_description)
-    competition = discretizer(competition, test_description)
-    preprocess += '_NDSC'
+    if SCALE_VALUES:
+        preprocess_id += '_stdsc'
+        scaler = sklearn.preprocessing.StandardScaler()
+        scaler.fit(x_train)
+        x_train = scaler.transform(x_train)
+        predict = scaler.transform(predict)
+        
+    if REMOVE_SKEW:
+        preprocess_id += '_unskew'
+        # We know there are only 6000 out of 25000 examples that are positive, let's turn that into 5000 out of 10000
+        positive = list(np.array([i for i in range(x_train.shape[0])])[y_train==1])
+        negative = list(np.array([i for i in range(x_train.shape[0])])[y_train==0])
+        prng = random.Random()
+        positive = prng.sample(positive, k=5000)
+        negative = prng.sample(negative, k=5000)
+        x_train = x_train[positive+negative]
+        y_train = y_train[positive+negative]
     
-    # One hot encoding
-    # data,data_description = OneHotEncoding(data, data_description)
-    # competition,test_description = OneHotEncoding(competition,test_description)
-    # preprocess += '_OHE'
-    for col in set(test_description['columns']) - set(data_description['columns']):
-        competition,test_description = remove_column(competition,test_description,col)
-    for i in range(len(test_description['columns'])):
-        if test_description['columns'][i] != data_description['columns'][i]:
-            competition, test_description = swap_columns(competition, test_description, test_description['columns'][i], data_description['columns'][i])
+    x_train, x_test, y_train, y_test = sklearn.model_selection.train_test_split(x_train, y_train, test_size=0.2, random_state = RANDOMNESS_SEED)
     
-    train,test = train_test_split(data, 0.8, seed=1337)
-    train_y = get_y(train, data_description)
-    test_y = get_y(test, data_description)
+    x_train = np.array(x_train)
+    y_train = np.array(y_train)
+    x_test = np.array(x_test)
+    y_test = np.array(y_test)
+    predict = np.array(predict)
     
-    # First real submission: Bagging
-    T = 50
-    step = 5
-    x = [i for i in range(1,T+1,step)]
-    coefficient = 0.3
+    votes_train = np.zeros(x_train.shape[0])
+    votes_test = np.zeros(x_test.shape[0])
+    votes_pred = np.zeros(predict.shape[0])
     
-    bag = Bagging(train, data_description, 0, m=int(len(train)*coefficient), seed=1337)
-    bag_train_errors = []
-    bag_test_errors = []
-    print("Coefficient",coefficient)
-    for i in range(1,T+1,step):
-        bag.modify_T(i)
-        train_pred = bag(train)
-        test_pred = bag(test)
-        bag_train_errors.append(1-accuracy(train_y, train_pred))
-        bag_test_errors.append(1-accuracy(test_y, test_pred))
-        print("T=",i,bag_train_errors[-1],bag_test_errors[-1])
-    if plot:
-        plt.figure(figsize=(10,6))
-        plt.plot(x,bag_train_errors, 'b')
-        plt.plot(x,bag_test_errors, 'r')
-        plt.legend(["Train","Test"])
-        plt.xlabel("Number of classifiers")
-        plt.ylabel("Error")
-        plt.show()
+    all_results = {'results': {'train': {}, 'test':{}}}
     
-    print("Column check:", data_description['columns'][:-1] == test_description['columns'])
+    ##### Neural Network
     
-    bag.modify_T(T)
-    train_pred = bag(train)
-    test_pred = bag(test)
-    bag_train_errors.append(1-accuracy(train_y, train_pred))
-    bag_test_errors.append(1-accuracy(test_y, test_pred))
-    print("T=",T,bag_train_errors[-1],bag_test_errors[-1])
-    final_prediction = bag(competition)
-    prediction_to_output(ids,final_prediction,f'Bagging{preprocess}_BAG{T}C3.csv')
-    results = np.array([int(i) for i in final_prediction])
+    print("Testing Neural Network Models")
+    if TUNE_NN:
+        torch.manual_seed(RANDOMNESS_SEED)
+        results = []
+        stime = time.time()
+        for H in [1,2,3,4,5]:
+            for S in [10, 20, 35, 50, 65, 85]:
+                for act in 'srlt':
+                    modelKwargs = {
+                        'layers': [x_train.shape[1], *(S for _ in range(H)), 1],
+                        'activation': act,
+                        'output_activation': 's',
+                    }
+                    measure = test_model_kfolds(x_train, y_train, 10, sklearn.metrics.accuracy_score, NeuralNetworkTrainer, RANDOMNESS_SEED, 
+                                      modelCls=NeuralNetwork,
+                                      optCls=opt.Adam,
+                                      lossF=nn.BCELoss,
+                                      error_threshold=1e-8,
+                                      max_iters=100000,
+                                      modelKwargs=modelKwargs)
+                    results.append((measure,H,S,act))
+                    print("Result:",*results[-1], "time since stime:",time.time()-stime)
+        results.sort(key=lambda x: x[0])
+        all_results['nn'] = results
+        best_model = results[-1]
+        print("Best model:",*best_model)
+        # Predict
+        torch.manual_seed(RANDOMNESS_SEED)
+        _,H,S,act = best_model
+        modelKwargs = {
+            'layers': [x_train.shape[1], *(S for _ in range(H)), 1],
+            'activation': act,
+            'output_activation': 's',
+        }
+        nnt = NeuralNetworkTrainer(modelCls=NeuralNetwork,
+                                      optCls=opt.Adam,
+                                      lossF=nn.BCELoss,
+                                      error_threshold=1e-8,
+                                      max_iters=100000,
+                                      modelKwargs=modelKwargs)
+        nnt.fit(x_train, y_train)
+        pred = nnt.predict(x_train)
+        votes_train += pred
+        all_results['results']['train']['nn'] = sklearn.metrics.accuracy_score(pred, y_train)
+        print("Accuracy for training set:", sklearn.metrics.accuracy_score(pred, y_train))
+        pred = nnt.predict(x_test)
+        votes_test += pred
+        all_results['results']['test']['nn'] = sklearn.metrics.accuracy_score(pred, y_test)
+        print("Accuracy for test set:", sklearn.metrics.accuracy_score(pred, y_test))
+        pred = nnt.predict(predict)
+        votes_pred += pred
+        prediction_to_output(ids,pred,"PredictionNN.csv")
+        del nnt
     
-    # Second real submission: AdaBoost
-    ada = AdaBoost(train, data_description, 0, max_depth=1)
-    ada_train_errors = []
-    ada_test_errors = []
-    for i in range(1,T+1,step):
-        ada.modify_T(i)
-        train_pred = ada(train)
-        test_pred = ada(test)
-        ada_train_errors.append(1-accuracy(train_y, train_pred))
-        ada_test_errors.append(1-accuracy(test_y, test_pred))
-        print("T=",i,ada_train_errors[-1],ada_test_errors[-1])
-    if plot:
-        plt.figure(figsize=(10,6))
-        plt.plot(x,ada_train_errors, 'b')
-        plt.plot(x,ada_test_errors, 'r')
-        plt.legend(["Train","Test"])
-        plt.xlabel("Number of classifiers")
-        plt.ylabel("Error")
-        plt.show()
+    ##### Random Forest
     
-    ada.modify_T(T)
-    train_pred = ada(train)
-    test_pred = ada(test)
-    ada_train_errors.append(1-accuracy(train_y, train_pred))
-    ada_test_errors.append(1-accuracy(test_y, test_pred))
-    print("T=",T,ada_train_errors[-1],ada_test_errors[-1])
-    final_prediction = ada(competition)
-    prediction_to_output(ids,final_prediction,f'AdaBoost{preprocess}_Ada{T}D1.csv')
-    results += np.array([int(i) for i in final_prediction])
+    print("Testing Random Forest Models")
+    if TUNE_RF:
+        results = []
+        stime = time.time()
+        for criterion in ["gini", "entropy", "log_loss"]:
+            for max_depth in [1, 2, 4, 8, None]:
+                for max_samples in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
+                    measure = test_model_kfolds(x_train, y_train, 10, sklearn.metrics.accuracy_score, sklearn.ensemble.RandomForestClassifier, RANDOMNESS_SEED, 
+                                      n_estimators = 100,
+                                      criterion=criterion,
+                                      max_depth=max_depth,
+                                      max_samples=max_samples,
+                                      random_state=RANDOMNESS_SEED
+                    )
+                    results.append((measure,criterion,max_depth,max_samples))
+                    print("Result:",*results[-1], "time since stime:",time.time()-stime)
+        results.sort(key=lambda x: x[0])
+        all_results['rf'] = results
+        best_model = results[-1]
+        print("Best model:",*best_model)
+        # Predict
+        _,criterion,max_depth,max_samples = best_model
+        rf = sklearn.ensemble.RandomForestClassifier(n_estimators = 100,
+                                      criterion=criterion,
+                                      max_depth=max_depth,
+                                      max_samples=max_samples,
+                                      random_state=RANDOMNESS_SEED)
+        rf.fit(x_train, y_train)
+        pred = rf.predict(x_train)
+        votes_train += pred
+        all_results['results']['train']['rf'] = sklearn.metrics.accuracy_score(pred, y_train)
+        print("Accuracy for training set:", sklearn.metrics.accuracy_score(pred, y_train))
+        pred = rf.predict(x_test)
+        votes_test += pred
+        all_results['results']['test']['rf'] = sklearn.metrics.accuracy_score(pred, y_test)
+        print("Accuracy for test set:", sklearn.metrics.accuracy_score(pred, y_test))
+        pred = rf.predict(predict)
+        votes_pred += pred
+        prediction_to_output(ids,pred,"PredictionRF.csv")
+        del rf
     
-    # Third real submission: Other AdaBoost
-    ada2 = AdaBoost(train, data_description, 0, max_depth=2)
-    ada2_train_errors = []
-    ada2_test_errors = []
-    for i in range(1,T+1,step):
-        ada2.modify_T(i)
-        train_pred = ada2(train)
-        test_pred = ada2(test)
-        ada2_train_errors.append(1-accuracy(train_y, train_pred))
-        ada2_test_errors.append(1-accuracy(test_y, test_pred))
-        print("T=",i,ada2_train_errors[-1],ada2_test_errors[-1])
-    if plot:
-        plt.figure(figsize=(10,6))
-        plt.plot(x,ada2_train_errors, 'b')
-        plt.plot(x,ada2_test_errors, 'r')
-        plt.legend(["Train","Test"])
-        plt.xlabel("Number of classifiers")
-        plt.ylabel("Error")
-        plt.show()
-    ada2.modify_T(T)
-    train_pred = ada2(train)
-    test_pred = ada2(test)
-    ada2_train_errors.append(1-accuracy(train_y, train_pred))
-    ada2_test_errors.append(1-accuracy(test_y, test_pred))
-    print("T=",T,ada2_train_errors[-1],ada2_test_errors[-1])
-    final_prediction = ada2(competition)
-    prediction_to_output(ids,final_prediction,f'AdaBoost{preprocess}_Ada{T}D2.csv')
-    results += np.array([int(i) for i in final_prediction])
+    ##### Bagging
     
-    prediction_to_output(ids,list((results>=2)*1),f'Mixed{preprocess}_Bagging{T}C3AdaBoost{T}D1AdaBoost{T}D2.csv')
+    print("Testing Bagging Models")
+    if TUNE_BAGGING:
+        results = []
+        stime = time.time()
+        for n_estimators in [10, 20, 50, 100]:
+            for max_samples in [0.25, 0.33, 0.5, 0.75, 1]:
+                for max_features in [0.25, 0.33, 0.5, 0.75, 1]:
+                    measure = test_model_kfolds(x_train, y_train, 10, sklearn.metrics.accuracy_score, sklearn.ensemble.BaggingClassifier, RANDOMNESS_SEED, 
+                                      n_estimators = n_estimators,
+                                      max_samples=max_samples,
+                                      max_features=max_features,
+                                      random_state=RANDOMNESS_SEED
+                    )
+                    results.append((measure,n_estimators,max_samples,max_features))
+                    print("Result:",*results[-1], "time since stime:",time.time()-stime)
+        results.sort(key=lambda x: x[0])
+        all_results['bagging'] = results
+        best_model = results[-1]
+        print("Best model:",*best_model)
+        # Predict
+        _,n_estimators,max_samples,max_features = best_model
+        bag = sklearn.ensemble.BaggingClassifier(n_estimators = n_estimators,
+                                      max_features=max_features,
+                                      max_samples=max_samples,
+                                      random_state=RANDOMNESS_SEED)
+        bag.fit(x_train, y_train)
+        pred = bag.predict(x_train)
+        votes_train += pred
+        all_results['results']['train']['bagging'] = sklearn.metrics.accuracy_score(pred, y_train)
+        print("Accuracy for training set:", sklearn.metrics.accuracy_score(pred, y_train))
+        pred = bag.predict(x_test)
+        votes_test += pred
+        all_results['results']['test']['bagging'] = sklearn.metrics.accuracy_score(pred, y_test)
+        print("Accuracy for test set:", sklearn.metrics.accuracy_score(pred, y_test))
+        pred = bag.predict(predict)
+        votes_pred += pred
+        prediction_to_output(ids,pred,"PredictionBagging.csv")
+        del bag
     
-    # for j in ['information_gain', 'gini_index', 'majority_error']:
-    #     tree_train_errors = []
-    #     tree_test_errors = []
-    #     for i in range(1,16+1):
-    #         tree = ID3( train, data_description, criterion = j, max_depth = i )
-    #         train_pred = tree(train)
-    #         test_pred = tree(test)
-    #         tree_train_errors.append(1-accuracy(train_y, train_pred))
-    #         tree_test_errors.append(1-accuracy(test_y, test_pred))
-    #         print("T=",i,tree_train_errors[-1],tree_test_errors[-1])
+    ##### SVM: Dataset too large, takes forever
     
-    # tree = ID3( train, data_description, criterion = 'information_gain', max_depth = 5, preprocess=[replacer])
-    # final_prediction = tree(competition)
-    # prediction_to_output(ids,final_prediction,f'Tree{preprocess}_TreeD5.csv')
+    # print("Testing SVM Models")
+    # if TUNE_SVM:
+    #     results = []
+    #     stime = time.time()
+    #     for kernel in ["poly", "rbf", "sigmoid"]:
+    #         for C in [ 1.0, 1.5, 2.0, 3.0, 4.0]:
+    #             measure = test_model_kfolds(x_train, y_train, 10, sklearn.metrics.accuracy_score, sklearn.svm.SVC, RANDOMNESS_SEED, 
+    #                                   C = C,
+    #                                   kernel = kernel,
+    #                                   random_state=RANDOMNESS_SEED
+    #             )
+    #             results.append((measure,kernel,C))
+    #             print("Result:",*results[-1], "time since stime:",time.time()-stime)
+    #     results.sort(key=lambda x: x[0])
+    #     all_results['svm'] = results
+    #     best_model = results[-1]
+    # else:
+    #     print("Results can be seen in the file: results_svm_tuning.txt")
+    #     best_model = tuple()
     
+    # if PREDICT_SVM:
+    #     _,kernel,C = best_model
+    #     svm = sklearn.svm.SVC(C = C, kernel = kernel, random_state=RANDOMNESS_SEED)
+    #     svm.fit(x_train, y_train)
+    #     pred = svm.predict(x_train)
+    #     print("Accuracy for training set:", sklearn.metrics.accuracy_score(pred, y_train))
+    #     pred = svm.predict(predict)
+    #     prediction_to_output(ids,pred,"PredictionSVM.csv")
+    
+    ##### Linear SGD
+    
+    print("Testing Linear SGD Models")
+    if TUNE_LINEARSGD:
+        results = []
+        stime = time.time()
+        for loss in ["hinge", "log_loss", "squared_hinge", "perceptron", "squared_error"]:
+            for alpha in [0.001, 0.0001, 0.00001]:
+                measure = test_model_kfolds(x_train, y_train, 10, sklearn.metrics.accuracy_score, sklearn.linear_model.SGDClassifier, RANDOMNESS_SEED, 
+                                      loss = loss,
+                                      alpha = alpha,
+                                      max_iter = 100000,
+                                      random_state=RANDOMNESS_SEED
+                )
+                results.append((measure,loss,alpha))
+                print("Result:",*results[-1], "time since stime:",time.time()-stime)
+        results.sort(key=lambda x: x[0])
+        all_results['linear_sgd'] = results
+        best_model = results[-1]
+        print("Best model:",*best_model)
+        # Predict
+        _,loss,alpha = best_model
+        sgd = sklearn.linear_model.SGDClassifier(loss = loss, alpha = alpha, max_iter = 100000, random_state=RANDOMNESS_SEED)
+        sgd.fit(x_train, y_train)
+        pred = sgd.predict(x_train)
+        votes_train += pred
+        all_results['results']['train']['linear_sgd'] = sklearn.metrics.accuracy_score(pred, y_train)
+        print("Accuracy for training set:", sklearn.metrics.accuracy_score(pred, y_train))
+        pred = sgd.predict(x_test)
+        votes_test += pred
+        all_results['results']['test']['linear_sgd'] = sklearn.metrics.accuracy_score(pred, y_test)
+        print("Accuracy for test set:", sklearn.metrics.accuracy_score(pred, y_test))
+        pred = sgd.predict(predict)
+        votes_pred += pred
+        prediction_to_output(ids,pred,"PredictionLinSGD.csv")
+        del sgd
+        
+    ##### K - Neighbors
+    
+    print("Testing K-Neighbors Models")
+    if TUNE_KNEIGHBORS:
+        results = []
+        stime = time.time()
+        for n_neighbors in [3, 5, 7, 9, 11, 13]:
+            for weights in ['uniform', 'distance']:
+                measure = test_model_kfolds(x_train, y_train, 10, sklearn.metrics.accuracy_score, sklearn.neighbors.KNeighborsClassifier, RANDOMNESS_SEED, 
+                                      n_neighbors = n_neighbors,
+                                      weights = weights)
+                results.append((measure,n_neighbors,weights))
+                print("Result:",*results[-1], "time since stime:",time.time()-stime)
+        results.sort(key=lambda x: x[0])
+        all_results['kneighbors'] = results
+        best_model = results[-1]
+        print("Best model:",*best_model)
+        # Predict
+        _,n_neighbors,weights = best_model
+        neighbors = sklearn.neighbors.KNeighborsClassifier(n_neighbors = n_neighbors, weights=weights)
+        neighbors.fit(x_train, y_train)
+        pred = neighbors.predict(x_train)
+        votes_train += pred
+        all_results['results']['train']['kneighbors'] = sklearn.metrics.accuracy_score(pred, y_train)
+        print("Accuracy for training set:", sklearn.metrics.accuracy_score(pred, y_train))
+        pred = neighbors.predict(x_test)
+        votes_test += pred
+        all_results['results']['test']['kneighbors'] = sklearn.metrics.accuracy_score(pred, y_test)
+        print("Accuracy for test set:", sklearn.metrics.accuracy_score(pred, y_test))
+        pred = neighbors.predict(predict)
+        votes_pred += pred
+        prediction_to_output(ids,pred,"PredictionKNeighbors.csv")
+        del neighbors
+
+    ##### Final 5-model voting system results
+    if TUNE_ALL:
+        print("Testing 5-model voting")
+        print("Accuracy for training set:", sklearn.metrics.accuracy_score(votes_train>=3, y_train))
+        print("Accuracy for test set:", sklearn.metrics.accuracy_score(votes_test>=3, y_test))
+        all_results['results']['train']['5model'] = sklearn.metrics.accuracy_score(votes_train>=3, y_train)
+        all_results['results']['test']['5model'] = sklearn.metrics.accuracy_score(votes_test>=3, y_test)
+        prediction_to_output(ids,np.array(votes_pred>=3,dtype=np.int32),"Prediction5Model.csv")
+
+    if TUNE_ALL and SAVE:
+        json_object = json.dumps(all_results, indent=4)
+        # Writing to sample.json
+        with open(f"results_5models{preprocess_id}.json", "w") as outfile:
+            outfile.write(json_object)
